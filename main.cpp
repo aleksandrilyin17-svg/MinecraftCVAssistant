@@ -1,6 +1,5 @@
 // ============================================================================
-// Minecraft CV AI Assistant — Single-File Edition (main.cpp)
-// Стек: C++17, Qt6 Widgets, OpenCV, libcurl, nlohmann::json, Win32 GDI / X11
+// Minecraft CV AI Assistant — Verified Single-File Edition (main.cpp)
 // ============================================================================
 
 #include <QApplication>
@@ -20,7 +19,9 @@
 #include <QPixmap>
 #include <QString>
 
-#include <opencv2/opencv.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
@@ -30,11 +31,16 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <chrono>
 #include <map>
+#include <algorithm>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -50,46 +56,81 @@ namespace fs = std::filesystem;
 // 1. Захват окна (Win32 GDI / Linux X11 / Демо-режим)
 // ============================================================================
 class ScreenCapturer {
+#ifdef _WIN32
+    struct WindowSearchData {
+        HWND foundHwnd = nullptr;
+    };
+
+    static BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+        if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
+
+        char title[256] = {0};
+        GetWindowTextA(hwnd, title, sizeof(title));
+        std::string titleStr(title);
+
+        // Ищем окно Minecraft, исключая окно нашего собственного приложения
+        if (titleStr.find("Minecraft") != std::string::npos &&
+            titleStr.find("Minecraft CV AI Assistant") == std::string::npos) {
+            auto* data = reinterpret_cast<WindowSearchData*>(lParam);
+            data->foundHwnd = hwnd;
+            return FALSE;
+        }
+        return TRUE;
+    }
+#endif
+
 public:
     bool captureMinecraftOrScreen(cv::Mat& outFrame, bool& isRealWindow) {
 #ifdef _WIN32
-        HWND hwnd = FindWindowA(nullptr, "Minecraft");
-        if (!hwnd) {
-            hwnd = GetDesktopWindow();
-            isRealWindow = false;
-        } else {
+        WindowSearchData searchData;
+        EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&searchData));
+        HWND hwnd = searchData.foundHwnd;
+
+        int width = 0;
+        int height = 0;
+        HDC hdcSource = nullptr;
+
+        if (hwnd) {
             isRealWindow = true;
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            width = rc.right - rc.left;
+            height = rc.bottom - rc.top;
+            hdcSource = GetDC(hwnd);
+        } else {
+            isRealWindow = false;
+            width = GetSystemMetrics(SM_CXSCREEN);
+            height = GetSystemMetrics(SM_CYSCREEN);
+            hdcSource = GetDC(nullptr);
         }
 
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        int width = rc.right - rc.left;
-        int height = rc.bottom - rc.top;
+        if (width <= 0 || height <= 0 || !hdcSource) {
+            if (hdcSource) ReleaseDC(hwnd, hdcSource);
+            return generateFallbackFrame(outFrame);
+        }
 
-        if (width <= 0 || height <= 0) return generateFallbackFrame(outFrame);
+        HDC hdcMem = CreateCompatibleDC(hdcSource);
+        HBITMAP hbm = CreateCompatibleBitmap(hdcSource, width, height);
+        HGDIOBJ oldObj = SelectObject(hdcMem, hbm);
 
-        HDC hdcScreen = GetDC(hwnd);
-        HDC hdcMem = CreateCompatibleDC(hdcScreen);
-        HBITMAP hbm = CreateCompatibleBitmap(hdcScreen, width, height);
-        SelectObject(hdcMem, hbm);
-
-        BitBlt(hdcMem, 0, 0, width, height, hdcScreen, 0, 0, SRCCOPY);
+        BitBlt(hdcMem, 0, 0, width, height, hdcSource, 0, 0, SRCCOPY);
 
         BITMAPINFOHEADER bi{};
         bi.biSize = sizeof(BITMAPINFOHEADER);
         bi.biWidth = width;
-        bi.biHeight = -height; // Top-down
+        bi.biHeight = -height; // Top-down изображение
         bi.biPlanes = 1;
         bi.biBitCount = 32;
         bi.biCompression = BI_RGB;
 
         cv::Mat bgra(height, width, CV_8UC4);
-        GetDIBits(hdcMem, hbm, 0, height, bgra.data, (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+        GetDIBits(hdcMem, hbm, 0, height, bgra.data, reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS);
         cv::cvtColor(bgra, outFrame, cv::COLOR_BGRA2BGR);
 
+        SelectObject(hdcMem, oldObj);
         DeleteObject(hbm);
         DeleteDC(hdcMem);
-        ReleaseDC(hwnd, hdcScreen);
+        ReleaseDC(hwnd, hdcSource);
         return true;
 
 #elif defined(__linux__)
@@ -136,28 +177,40 @@ public:
     static cv::Rect getTargetROI(const cv::Mat& frame) {
         int w = frame.cols;
         int h = frame.rows;
-        int boxW = std::min(w, h) / 2;
+        int boxW = std::max(2, std::min(w, h) / 2);
         int boxH = boxW;
-        return cv::Rect((w - boxW) / 2, (h - boxH) / 2, boxW, boxH);
+        int x = std::max(0, (w - boxW) / 2);
+        int y = std::max(0, (h - boxH) / 2);
+        boxW = std::min(boxW, w - x);
+        boxH = std::min(boxH, h - y);
+        return cv::Rect(x, y, boxW, boxH);
     }
 
     static std::vector<float> extract(const cv::Mat& frame) {
-        if (frame.empty()) return std::vector<float>(1024, 0.0f);
+        if (frame.empty() || frame.cols < 4 || frame.rows < 4) {
+            return std::vector<float>(1024, 0.0f);
+        }
 
         cv::Rect roi = getTargetROI(frame);
         cv::Mat cropped = frame(roi);
 
-        cv::Mat gray, resized;
+        cv::Mat gray, resized, floatMat;
         if (cropped.channels() == 3) {
             cv::cvtColor(cropped, gray, cv::COLOR_BGR2GRAY);
+        } else if (cropped.channels() == 4) {
+            cv::cvtColor(cropped, gray, cv::COLOR_BGRA2GRAY);
         } else {
             gray = cropped;
         }
 
         cv::resize(gray, resized, cv::Size(32, 32), 0, 0, cv::INTER_AREA);
-        resized.convertTo(resized, CV_32F);
+        resized.convertTo(floatMat, CV_32F);
+        if (!floatMat.isContinuous()) {
+            floatMat = floatMat.clone();
+        }
 
-        std::vector<float> vec(resized.begin<float>(), resized.end<float>());
+        const float* ptr = floatMat.ptr<float>(0);
+        std::vector<float> vec(ptr, ptr + 1024);
 
         float norm = 0.0f;
         for (float v : vec) norm += v * v;
@@ -201,30 +254,50 @@ private:
         return std::sqrt(sum);
     }
 
+    static std::string sanitizeName(const std::string& raw) {
+        std::string clean;
+        for (char c : raw) {
+            if (c == '/' || c == '\\' || c == ':' || c == '*' ||
+                c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+                clean += '_';
+            } else {
+                clean += c;
+            }
+        }
+        return clean.empty() ? "player" : clean;
+    }
+
 public:
     PlayerLibrary() {
-        fs::create_directories(baseDir_);
-        if (!loadCache()) {
-            rebuildFromDisk();
-        }
+        try {
+            fs::create_directories(baseDir_);
+            if (!loadCache()) {
+                rebuildFromDisk();
+            }
+        } catch (...) {}
     }
 
     bool addLabeledFrame(const std::string& playerName, const cv::Mat& frame) {
         if (playerName.empty() || frame.empty()) return false;
 
-        fs::path playerDir = fs::path(baseDir_) / playerName;
-        fs::create_directories(playerDir);
+        try {
+            std::string safeFolder = sanitizeName(playerName);
+            fs::path playerDir = fs::path(baseDir_) / safeFolder;
+            fs::create_directories(playerDir);
 
-        auto now = std::chrono::system_clock::now().time_since_epoch().count();
-        std::string filename = "sample_" + std::to_string(now) + ".png";
-        fs::path fullPath = playerDir / filename;
+            auto now = std::chrono::system_clock::now().time_since_epoch().count();
+            std::string filename = "sample_" + std::to_string(now) + ".png";
+            fs::path fullPath = playerDir / filename;
 
-        if (!cv::imwrite(fullPath.string(), frame)) return false;
+            if (!cv::imwrite(fullPath.string(), frame)) return false;
 
-        std::vector<float> emb = EmbeddingExtractor::extract(frame);
-        samples_.push_back({playerName, emb, fullPath.string()});
-        saveCache();
-        return true;
+            std::vector<float> emb = EmbeddingExtractor::extract(frame);
+            samples_.push_back({playerName, emb, fullPath.string()});
+            saveCache();
+            return true;
+        } catch (...) {
+            return false;
+        }
     }
 
     SearchMatch searchKNN(const cv::Mat& currentFrame, float threshold) const {
@@ -258,27 +331,29 @@ public:
         samples_.clear();
         if (!fs::exists(baseDir_)) return;
 
-        for (const auto& dirEntry : fs::directory_iterator(baseDir_)) {
-            if (dirEntry.is_directory()) {
-                std::string playerName = dirEntry.path().filename().string();
-                for (const auto& imgEntry : fs::directory_iterator(dirEntry.path())) {
-                    cv::Mat img = cv::imread(imgEntry.path().string());
-                    if (!img.empty()) {
-                        samples_.push_back({
-                            playerName,
-                            EmbeddingExtractor::extract(img),
-                            imgEntry.path().string()
-                        });
+        try {
+            for (const auto& dirEntry : fs::directory_iterator(baseDir_)) {
+                if (dirEntry.is_directory()) {
+                    std::string playerName = dirEntry.path().filename().string();
+                    for (const auto& imgEntry : fs::directory_iterator(dirEntry.path())) {
+                        cv::Mat img = cv::imread(imgEntry.path().string());
+                        if (!img.empty()) {
+                            samples_.push_back({
+                                playerName,
+                                EmbeddingExtractor::extract(img),
+                                imgEntry.path().string()
+                            });
+                        }
                     }
                 }
             }
-        }
-        saveCache();
+            saveCache();
+        } catch (...) {}
     }
 
     bool saveCache() const {
         std::ofstream out(cacheFile_, std::ios::binary);
-        if (!out) return false;
+        if (!out.is_open()) return false;
 
         uint32_t count = static_cast<uint32_t>(samples_.size());
         out.write(reinterpret_cast<const char*>(&count), sizeof(count));
@@ -296,32 +371,33 @@ public:
             out.write(reinterpret_cast<const char*>(&dim), sizeof(dim));
             out.write(reinterpret_cast<const char*>(s.embedding.data()), dim * sizeof(float));
         }
-        return true;
+        return out.good();
     }
 
     bool loadCache() {
         std::ifstream in(cacheFile_, std::ios::binary);
-        if (!in) return false;
+        if (!in.is_open()) return false;
 
         samples_.clear();
         uint32_t count = 0;
-        in.read(reinterpret_cast<char*>(&count), sizeof(count));
+        if (!in.read(reinterpret_cast<char*>(&count), sizeof(count))) return false;
+        if (count == 0 || count > 100000) return false;
 
         for (uint32_t i = 0; i < count; ++i) {
             uint32_t nameLen = 0;
-            in.read(reinterpret_cast<char*>(&nameLen), sizeof(nameLen));
+            if (!in.read(reinterpret_cast<char*>(&nameLen), sizeof(nameLen)) || nameLen > 1024) return false;
             std::string name(nameLen, '\0');
-            in.read(&name[0], nameLen);
+            if (!in.read(&name[0], nameLen)) return false;
 
             uint32_t pathLen = 0;
-            in.read(reinterpret_cast<char*>(&pathLen), sizeof(pathLen));
+            if (!in.read(reinterpret_cast<char*>(&pathLen), sizeof(pathLen)) || pathLen > 4096) return false;
             std::string path(pathLen, '\0');
-            in.read(&path[0], pathLen);
+            if (!in.read(&path[0], pathLen)) return false;
 
             uint32_t dim = 0;
-            in.read(reinterpret_cast<char*>(&dim), sizeof(dim));
+            if (!in.read(reinterpret_cast<char*>(&dim), sizeof(dim)) || dim != 1024) return false;
             std::vector<float> emb(dim);
-            in.read(reinterpret_cast<char*>(emb.data()), dim * sizeof(float));
+            if (!in.read(reinterpret_cast<char*>(emb.data()), dim * sizeof(float))) return false;
 
             samples_.push_back({std::move(name), std::move(emb), std::move(path)});
         }
@@ -335,7 +411,8 @@ public:
 class WikiClient {
 private:
     static size_t writeCb(void* contents, size_t size, size_t nmemb, void* userp) {
-        ((std::string*)userp)->append((char*)contents, size * nmemb);
+        auto* str = static_cast<std::string*>(userp);
+        str->append(static_cast<char*>(contents), size * nmemb);
         return size * nmemb;
     }
 
@@ -346,17 +423,31 @@ public:
         CURL* curl = curl_easy_init();
         if (!curl) return "Ошибка инициализации libcurl.";
 
+        // Заменяем пробелы на подчеркивания для корректного URL Wikipedia REST API
+        std::string normalizedTitle = queryTitle;
+        for (char& c : normalizedTitle) {
+            if (c == ' ') c = '_';
+        }
+
         std::string responseBuffer;
-        char* escaped = curl_easy_escape(curl, queryTitle.c_str(), static_cast<int>(queryTitle.size()));
+        char* escaped = curl_easy_escape(curl, normalizedTitle.c_str(), static_cast<int>(normalizedTitle.size()));
+        if (!escaped) {
+            curl_easy_cleanup(curl);
+            return "Ошибка кодирования запроса.";
+        }
+
         std::string url = "https://" + lang + ".wikipedia.org/api/rest_v1/page/summary/" + std::string(escaped);
         curl_free(escaped);
 
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "MinecraftCVAssistant/2.0 (SingleFile Qt6)");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "MinecraftCVAssistant/2.0 (Windows Qt6)");
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCb);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBuffer);
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 6L);
+        // Отключаем привязку к локальному файлу сертификатов, чтобы .exe работал на любом ПК
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 
         CURLcode res = curl_easy_perform(curl);
         curl_easy_cleanup(curl);
@@ -367,8 +458,9 @@ public:
 
         try {
             auto j = nlohmann::json::parse(responseBuffer);
-            if (j.contains("extract") && !j["extract"].get<std::string>().empty()) {
-                return j["extract"].get<std::string>();
+            if (j.contains("extract") && j["extract"].is_string()) {
+                std::string ext = j["extract"].get<std::string>();
+                if (!ext.empty()) return ext;
             }
         } catch (...) {
             return "Ошибка разбора JSON-ответа Wikipedia.";
@@ -382,310 +474,4 @@ public:
     }
 };
 
-// ============================================================================
-// 5. Графический интерфейс (Qt6 MainWindow без необходимости MOC)
-// ============================================================================
-class MainWindow : public QMainWindow {
-private:
-    ScreenCapturer capturer_;
-    PlayerLibrary library_;
-    cv::Mat currentFrame_;
-    bool isFrozen_ = false;
-    float threshold_ = 0.35f;
-
-    QLabel* videoLabel_;
-    QLabel* statusBadge_;
-    QPushButton* freezeBtn_;
-    QLineEdit* addNameEdit_;
-    QPushButton* addSampleBtn_;
-    QLineEdit* queryNameEdit_;
-    QSlider* thresholdSlider_;
-    QLabel* thresholdValLabel_;
-    QPushButton* identifyBtn_;
-    QListWidget* libraryListWidget_;
-    QTextBrowser* resultBrowser_;
-    QTimer* captureTimer_;
-
-public:
-    explicit MainWindow(QWidget* parent = nullptr) : QMainWindow(parent) {
-        setWindowTitle("Minecraft CV AI Assistant — Single File Edition");
-        resize(1180, 720);
-        applyModernDarkStyle();
-        setupUI();
-        refreshLibraryList();
-
-        captureTimer_ = new QTimer(this);
-        connect(captureTimer_, &QTimer::timeout, this, [this]() { onTickFrame(); });
-        captureTimer_->start(33);
-    }
-
-private:
-    void onTickFrame() {
-        if (isFrozen_) return;
-
-        bool isRealMC = false;
-        if (!capturer_.captureMinecraftOrScreen(currentFrame_, isRealMC)) return;
-
-        cv::Mat displayMat = currentFrame_.clone();
-        cv::Rect roi = EmbeddingExtractor::getTargetROI(displayMat);
-        cv::rectangle(displayMat, roi, cv::Scalar(16, 185, 129), 2);
-        cv::putText(displayMat, "SCAN ZONE (ROI)", cv::Point(roi.x + 8, roi.y + 24),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(16, 185, 129), 2);
-
-        statusBadge_->setText(isRealMC
-            ? "🟢 Захват: Окно Minecraft активно"
-            : "🟡 Захват: Рабочий стол (Окно Minecraft не найдено)");
-
-        cv::Mat rgb;
-        cv::cvtColor(displayMat, rgb, cv::COLOR_BGR2RGB);
-        QImage qimg(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888);
-        videoLabel_->setPixmap(QPixmap::fromImage(qimg).scaled(
-            videoLabel_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
-    }
-
-    void onToggleFreeze() {
-        isFrozen_ = !isFrozen_;
-        if (isFrozen_) {
-            freezeBtn_->setText("▶ Возобновить поток");
-            freezeBtn_->setStyleSheet("background-color: #F59E0B; color: #111827; font-weight: bold;");
-            statusBadge_->setText("⏸ Кадр заморожен — можно добавить игрока или распознать");
-        } else {
-            freezeBtn_->setText("⏸ Заморозить кадр (Freeze)");
-            freezeBtn_->setStyleSheet("");
-        }
-    }
-
-    void onAddPlayerSample() {
-        QString qName = addNameEdit_->text().trimmed();
-        if (qName.isEmpty()) {
-            showResultCard("⚠️ Укажите ник игрока",
-                           "Введите имя игрока в поле выше, чтобы сохранить текущий кадр в локальную библиотеку.",
-                           "#F59E0B");
-            return;
-        }
-
-        if (currentFrame_.empty()) return;
-
-        if (library_.addLabeledFrame(qName.toStdString(), currentFrame_)) {
-            refreshLibraryList();
-            showResultCard("✅ Кадр добавлен в базу",
-                           QString("Образец для игрока <b>%1</b> сохранен в <code>players/%1</code> и закэширован.").arg(qName),
-                           "#10B981");
-            addNameEdit_->clear();
-        }
-    }
-
-    void onIdentifyOrAskWiki() {
-        if (currentFrame_.empty()) return;
-
-        QString requestedName = queryNameEdit_->text().trimmed();
-        SearchMatch match = library_.searchKNN(currentFrame_, threshold_);
-
-        if (match.matched) {
-            QString html = QString(
-                "<div style='color:#10B981; font-size:16px; font-weight:bold; margin-bottom:6px;'>"
-                "🎯 Игрок распознан в локальной базе (k-NN)</div>"
-                "<p style='font-size:15px;'>Никнейм: <b>%1</b></p>"
-                "<p style='color:#9CA3AF;'>Евклидова дистанция: <b>%2</b> (Порог: %3)</p>"
-            ).arg(QString::fromStdString(match.playerName))
-             .arg(match.distance, 0, 'f', 3)
-             .arg(threshold_, 0, 'f', 2);
-
-            resultBrowser_->setHtml(html);
-        } else {
-            std::string wikiQuery = requestedName.isEmpty() ? match.playerName : requestedName.toStdString();
-            if (wikiQuery.empty()) wikiQuery = "Minecraft";
-
-            std::string wikiExtract = WikiClient::fetchSummary(wikiQuery);
-
-            QString html = QString(
-                "<div style='color:#60A5FA; font-size:16px; font-weight:bold; margin-bottom:6px;'>"
-                "🌐 В локальной базе не найден — Справка из Wikipedia</div>"
-                "<p style='color:#9CA3AF; font-size:12px;'>Ближайшая дистанция k-NN: %1 (выше порога %2) | Запрос: <b>%3</b></p>"
-                "<hr style='border:1px solid #2D313E;'/>"
-                "<p style='font-size:14px; line-height:1.5; color:#E5E7EB;'>%4</p>"
-            ).arg(match.distance, 0, 'f', 3)
-             .arg(threshold_, 0, 'f', 2)
-             .arg(QString::fromStdString(wikiQuery))
-             .arg(QString::fromStdString(wikiExtract));
-
-            resultBrowser_->setHtml(html);
-        }
-    }
-
-    void setupUI() {
-        QWidget* central = new QWidget(this);
-        setCentralWidget(central);
-
-        QHBoxLayout* rootLayout = new QHBoxLayout(central);
-        rootLayout->setContentsMargins(16, 16, 16, 16);
-        rootLayout->setSpacing(16);
-
-        QFrame* leftPanel = new QFrame();
-        leftPanel->setObjectName("CardPanel");
-        QVBoxLayout* leftLayout = new QVBoxLayout(leftPanel);
-        leftLayout->setContentsMargins(14, 14, 14, 14);
-        leftLayout->setSpacing(10);
-
-        QHBoxLayout* topBar = new QHBoxLayout();
-        statusBadge_ = new QLabel("🟡 Инициализация захвата...");
-        statusBadge_->setStyleSheet("font-weight: 600; color: #D1D5DB;");
-        freezeBtn_ = new QPushButton("⏸ Заморозить кадр (Freeze)");
-        connect(freezeBtn_, &QPushButton::clicked, this, [this]() { onToggleFreeze(); });
-
-        topBar->addWidget(statusBadge_);
-        topBar->addStretch();
-        topBar->addWidget(freezeBtn_);
-
-        videoLabel_ = new QLabel();
-        videoLabel_->setMinimumSize(640, 480);
-        videoLabel_->setAlignment(Qt::AlignCenter);
-        videoLabel_->setStyleSheet("background-color: #0B0C10; border-radius: 10px; border: 1px solid #262936;");
-
-        leftLayout->addLayout(topBar);
-        leftLayout->addWidget(videoLabel_, 1);
-
-        QVBoxLayout* rightLayout = new QVBoxLayout();
-        rightLayout->setSpacing(12);
-
-        QFrame* trainCard = new QFrame();
-        trainCard->setObjectName("CardPanel");
-        QVBoxLayout* trainLayout = new QVBoxLayout(trainCard);
-        QLabel* trainTitle = new QLabel("➕ Пополнить библиотеку игроков");
-        trainTitle->setObjectName("SectionTitle");
-
-        QHBoxLayout* trainInputRow = new QHBoxLayout();
-        addNameEdit_ = new QLineEdit();
-        addNameEdit_->setPlaceholderText("Ник игрока на экране (например, Notch)...");
-        addSampleBtn_ = new QPushButton("Сохранить кадр");
-        addSampleBtn_->setObjectName("PrimaryBtn");
-        connect(addSampleBtn_, &QPushButton::clicked, this, [this]() { onAddPlayerSample(); });
-
-        trainInputRow->addWidget(addNameEdit_, 1);
-        trainInputRow->addWidget(addSampleBtn_);
-        trainLayout->addWidget(trainTitle);
-        trainLayout->addLayout(trainInputRow);
-
-        QFrame* searchCard = new QFrame();
-        searchCard->setObjectName("CardPanel");
-        QVBoxLayout* searchLayout = new QVBoxLayout(searchCard);
-        QLabel* searchTitle = new QLabel("🔍 Распознавание k-NN + Wikipedia API");
-        searchTitle->setObjectName("SectionTitle");
-
-        queryNameEdit_ = new QLineEdit();
-        queryNameEdit_->setPlaceholderText("О ком спросить, если не распознан? (необязательно)");
-
-        QHBoxLayout* sliderRow = new QHBoxLayout();
-        QLabel* sliderText = new QLabel("Порог k-NN:");
-        thresholdSlider_ = new QSlider(Qt::Horizontal);
-        thresholdSlider_->setRange(5, 100);
-        thresholdSlider_->setValue(35);
-        thresholdValLabel_ = new QLabel("0.35");
-        thresholdValLabel_->setFixedWidth(40);
-
-        connect(thresholdSlider_, &QSlider::valueChanged, this, [this](int val) {
-            threshold_ = val / 100.0f;
-            thresholdValLabel_->setText(QString::number(threshold_, 'f', 2));
-        });
-
-        sliderRow->addWidget(sliderText);
-        sliderRow->addWidget(thresholdSlider_, 1);
-        sliderRow->addWidget(thresholdValLabel_);
-
-        identifyBtn_ = new QPushButton("⚡ Распознать кадр / Найти в Wikipedia");
-        identifyBtn_->setObjectName("AccentBtn");
-        connect(identifyBtn_, &QPushButton::clicked, this, [this]() { onIdentifyOrAskWiki(); });
-
-        searchLayout->addWidget(searchTitle);
-        searchLayout->addWidget(queryNameEdit_);
-        searchLayout->addLayout(sliderRow);
-        searchLayout->addWidget(identifyBtn_);
-
-        QFrame* libCard = new QFrame();
-        libCard->setObjectName("CardPanel");
-        QVBoxLayout* libLayout = new QVBoxLayout(libCard);
-        QLabel* libTitle = new QLabel("📂 Локальная база эмбеддингов (Кэш)");
-        libTitle->setObjectName("SectionTitle");
-        libraryListWidget_ = new QListWidget();
-        libraryListWidget_->setMaximumHeight(130);
-        libLayout->addWidget(libTitle);
-        libLayout->addWidget(libraryListWidget_);
-
-        QFrame* resCard = new QFrame();
-        resCard->setObjectName("CardPanel");
-        QVBoxLayout* resLayout = new QVBoxLayout(resCard);
-        QLabel* resTitle = new QLabel("💬 Ответ ИИ-ассистента");
-        resTitle->setObjectName("SectionTitle");
-        resultBrowser_ = new QTextBrowser();
-        resultBrowser_->setOpenExternalLinks(true);
-        showResultCard("Готов к работе",
-                       "Наведите центральную рамку <b>SCAN ZONE</b> на игрока и нажмите «Распознать кадр», либо добавьте новый образец.",
-                       "#9CA3AF");
-        resLayout->addWidget(resTitle);
-        resLayout->addWidget(resultBrowser_, 1);
-
-        rightLayout->addWidget(trainCard);
-        rightLayout->addWidget(searchCard);
-        rightLayout->addWidget(libCard);
-        rightLayout->addWidget(resCard, 1);
-
-        rootLayout->addWidget(leftPanel, 3);
-        rootLayout->addLayout(rightLayout, 2);
-    }
-
-    void refreshLibraryList() {
-        libraryListWidget_->clear();
-        auto counts = library_.getPlayerCounts();
-        if (counts.empty()) {
-            libraryListWidget_->addItem("База пуста — добавьте первый скриншот игрока");
-            return;
-        }
-        for (const auto& [name, count] : counts) {
-            libraryListWidget_->addItem(
-                QString("👤 %1  —  %2 кадр(ов) в кэше").arg(QString::fromStdString(name)).arg(count)
-            );
-        }
-    }
-
-    void showResultCard(const QString& title, const QString& body, const QString& colorHex) {
-        resultBrowser_->setHtml(QString(
-            "<div style='color:%1; font-size:15px; font-weight:bold; margin-bottom:6px;'>%2</div>"
-            "<div style='color:#D1D5DB; font-size:13px; line-height:1.45;'>%3</div>"
-        ).arg(colorHex, title, body));
-    }
-
-    void applyModernDarkStyle() {
-        setStyleSheet(R"(
-            QMainWindow { background-color: #0F1117; }
-            QWidget { color: #F3F4F6; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
-            QFrame#CardPanel { background-color: #181B24; border: 1px solid #262A38; border-radius: 12px; }
-            QLabel#SectionTitle { font-size: 14px; font-weight: bold; color: #FFFFFF; margin-bottom: 4px; }
-            QLineEdit { background-color: #101218; border: 1px solid #2E3346; border-radius: 8px; padding: 8px 10px; color: #FFFFFF; }
-            QLineEdit:focus { border: 1px solid #10B981; }
-            QPushButton { background-color: #262B3D; border: 1px solid #353C52; border-radius: 8px; padding: 8px 14px; font-weight: 600; color: #E5E7EB; }
-            QPushButton:hover { background-color: #31374D; }
-            QPushButton#PrimaryBtn { background-color: #10B981; border: none; color: #06281E; font-weight: bold; }
-            QPushButton#PrimaryBtn:hover { background-color: #34D399; }
-            QPushButton#AccentBtn { background-color: #6366F1; border: none; color: #FFFFFF; padding: 10px; font-size: 14px; font-weight: bold; }
-            QPushButton#AccentBtn:hover { background-color: #818CF8; }
-            QListWidget, QTextBrowser { background-color: #101218; border: 1px solid #262A38; border-radius: 8px; padding: 6px; }
-            QSlider::groove:horizontal { height: 6px; background: #262A38; border-radius: 3px; }
-            QSlider::handle:horizontal { background: #10B981; width: 16px; margin: -5px 0; border-radius: 8px; }
-        )");
-    }
-};
-
-// ============================================================================
-// 6. Точка входа
-// ============================================================================
-int main(int argc, char *argv[]) {
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-
-    QApplication app(argc, argv);
-    MainWindow window;
-    window.show();
-
-    int ret = app.exec();
-    curl_global_cleanup();
-    return ret;
-}
+// =================================
