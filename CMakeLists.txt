@@ -4,14 +4,10 @@ project(MinecraftCVAssistant LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
-set(CMAKE_AUTOUIC ON)
-
 find_package(Qt6 COMPONENTS Widgets Core Gui REQUIRED)
-find_package(OpenCV REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(CURL REQUIRED)
-find_package(nlohmann_json 3.2.0 REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
 add_executable(MinecraftCVAssistant main.cpp)
 
