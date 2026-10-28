@@ -21,3 +21,20 @@ target_link_libraries(MinecraftCVAssistant PRIVATE
     gdi32
     user32
 )
+- name: Configure
+  shell: msys2 {0}
+  run: |
+    cmake -S . -B build -G "Ninja" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_PREFIX_PATH=/ucrt64
+
+- name: Build
+  shell: msys2 {0}
+  run: |
+    cmake --build build --config Release
+find_package(Qt6 REQUIRED COMPONENTS Widgets)
+find_package(OpenCV REQUIRED)
+find_package(CURL REQUIRED)
+
+add_executable(MinecraftCVAssistant main.cpp)
+target_link_libraries(MinecraftCVAssistant PRIVATE Qt6::Widgets ${OpenCV_LIBS} CURL::libcurl)
