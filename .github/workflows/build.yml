@@ -17,18 +17,23 @@ jobs:
           install: >-
             git
             mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-qt6-base
             mingw-w64-ucrt-x86_64-opencv
             mingw-w64-ucrt-x86_64-curl
             mingw-w64-ucrt-x86_64-nlohmann-json
 
-      - name: Build with g++
+      - name: Build with CMake
         shell: msys2 {0}
         run: |
-          g++ main.cpp -o MinecraftCVAssistant.exe -std=c++17 -O2 -fno-keep-inline-dllexport -I/ucrt64/include -I/ucrt64/include/qt6 -I/ucrt64/include/qt6/QtWidgets -I/ucrt64/include/qt6/QtGui -I/ucrt64/include/qt6/QtCore -I/ucrt64/include/opencv4 -L/ucrt64/lib -lQt6Widgets -lQt6Gui -lQt6Core -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lcurl -lgdi32 -luser32
+          mkdir build
+          cd build
+          cmake -G Ninja ..
+          ninja
 
       - name: Upload compiled EXE
         uses: actions/upload-artifact@v4
         with:
           name: MinecraftCVAssistant-Windows
-          path: MinecraftCVAssistant.exe
+          path: build/MinecraftCVAssistant.exe
