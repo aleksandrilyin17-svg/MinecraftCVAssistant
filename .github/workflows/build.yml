@@ -4,8 +4,8 @@ on: [push]
 
 jobs:
   build:
-      runs-on: windows-latest
-      steps:
+    runs-on: windows-latest
+    steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -15,8 +15,7 @@ jobs:
           msystem: UCRT64
           update: true
           install: >-
-            git
-            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-qt6-base
@@ -27,13 +26,21 @@ jobs:
       - name: Build with CMake
         shell: msys2 {0}
         run: |
-          mkdir build
+          mkdir -p build
           cd build
-          cmake -G Ninja ..
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
           ninja
 
-      - name: Upload compiled EXE
+      - name: Bundle DLLs for Portable Run
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist
+          cp build/MinecraftCVAssistant.exe dist/
+          windeployqt6 dist/MinecraftCVAssistant.exe
+          ldd build/MinecraftCVAssistant.exe | grep "/ucrt64/bin/" | awk '{print $3}' | xargs -I {} cp -f {} dist/
+
+      - name: Upload Portable App
         uses: actions/upload-artifact@v4
         with:
-          name: MinecraftCVAssistant-Windows
-          path: build/MinecraftCVAssistant.exe
+          name: MinecraftCVAssistant-Portable
+          path: dist/
